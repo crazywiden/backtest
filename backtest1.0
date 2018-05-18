@@ -1,0 +1,344 @@
+ # -*- coding: utf-8 -*-
+"""
+Created on Thu Apr 12 18:56:34 2018
+
+@author: DIY
+this is a backtest platform
+"""
+#=======================导言区========================
+import numpy as np
+import pandas as pd
+import scipy.io as scio#用于导入.mat文件
+import plotly.offline as py
+import plotly.graph_objs as go
+from plotly import tools
+import time
+import scipy.stats as scistat
+import os
+#======================函数区========================
+def csv2h5(root_path="D:\\data\\csv_raw_data\\"):
+    """
+    用于将原始的csv数据导出为hdf5数据提高计算值
+    """
+    file_name = []
+    file_path = []
+    stock_data = {}
+    index_data = {}
+    for root,dirs,files in os.walk(root_path):
+        for file in files:
+            if file.endswith('.xlsx'):
+                factor_name = file[:-5]
+                factor_path = os.path.join(root,file)
+                file_name.append(factor_name)
+                file_path.append(factor_path)
+                print(factor_name)
+                
+                data = pd.read_excel(factor_path,sheet_name = 'Sheet2',
+                                     header=0,index_col=0)
+                stock_data[factor_name] = data.iloc[:,1:]
+                index_data[factor_name] = data.iloc[:,0]
+            
+    stock_h5 = pd.HDFStore('D:\\data\\h5_raw_data\\stock.h5','w')
+    index_h5 = pd.HDFStore('D:\\data\\h5_raw_data\\index.h5','w')
+    for file in file_name:
+        stock_h5[file] = stock_data[file]
+        index_h5[file] = index_data[file]
+    stock_h5.close()
+    index_h5.close()
+    
+def data_import(root_path='D:\\data\\h5_raw_data\\'):
+    """
+    用于导入数据
+    ['Hsl_all', 'Hsl_c', 'mktvalue_all', 'mktvalue_c', 'price_close', 
+    'price_high', 'price_low', 'price_open', 'is_trade', 
+    'Vol_amount', 'Vol_val']
+    """
+  
+    all_key = ['Hsl_all', 'Hsl_c', 'mktvalue_all', 'mktvalue_c', 'price_close', \
+    'price_high', 'price_low', 'price_open', 'is_trade', \
+    'Vol_amount', 'Vol_val']
+    stock_data={}
+    index_data={}
+    for keys in all_key:
+        stock_data[keys] = pd.read_hdf(root_path+'stock.h5',key=keys)
+        index_data[keys] = pd.read_hdf(root_path+'index.h5',key=keys)
+    
+    return stock_data, index_data
+
+
+def performance_cal(factor,stock_data,index_data,num_stock,period,time_interval,cost):
+    """
+    输入数据
+        factor: DataFrame类型，为所有股票在每一天的因子值
+        stock_data,index_data: dict类型，用于计算的所有数据
+        num_stock: int类型，每次换手时需要买的股票
+        period: int类型，换仓周期
+        time_interval: list类型，time_interval[0]回测开始时间，time_interval[1]回测结束时间
+        cost: double类型，换仓成本
+    函数作用
+        夏普率，波动率，年化收益率，最大回撤，IC值，每月收益率，每月IC值，每日回撤
+        股票每日净值序列，指数每日净值序列
+    返回值 perform为dict类型
+    """
+    stock_pos,index_pos,factor,stock_indice = pos_cal(factor,stock_data,index_data,\
+                                                      num_stock,period,time_interval,cost)
+
+    stock_value = stock_pos.sum(axis=1)
+    index_value = index_pos.sum(axis=1)
+    
+    stock_rtn_arith = stock_value.shift(1)/stock_value
+    stock_rtn_arith[0] = 1#如果不赋值，则第一个值为NaN
+    index_rtn_arith = index_value.shift(1)/index_value
+    index_rtn_arith[0] = 1
+    
+    net_rtn_arith = (stock_rtn_arith - index_rtn_arith)/2#算数收益率取平均值
+    net_rtn = np.log(net_rtn_arith+1).cumsum()
+    #股票和指数的对数收益率
+    stock_rtn = np.log(stock_rtn_arith)
+    index_rtn = np.log(index_rtn_arith)
+    #年化对数收益率
+    net_rtn_year = net_rtn.iloc[-1]/stock_pos.shape[0]*250
+    
+    #夏普率
+    sharpe = net_rtn.mean()/net_rtn.std()  
+    
+    #月度分界线
+    month_bp = pd.date_range(net_rtn.index[0],net_rtn.index[-1],freq='M')
+    #分月度对数收益率
+    net_rtn_month = []
+    for i in np.arange(1,len(month_bp)):
+        stock_s = stock_rtn.truncate(before=month_bp[i-1],after=month_bp[i])
+        index_s = index_rtn.truncate(before=month_bp[i-1],after=month_bp[i])
+        rtn_s = (stock_s-index_s)/2
+        net_rtn_month.append(rtn_s.sum())
+        
+    stock_rtn = stock_rtn.cumsum()
+    index_rtn = index_rtn.cumsum().cumsum()
+    net_rtn_month = pd.DataFrame(net_rtn_month,index=month_bp[1:])
+    
+    #策略最大回撤
+    net_value = np.exp(net_rtn)#每天净值变化序列
+    max_draw_down,draw_down_list = draw_down_cal(net_value)#整个区间的最大回撤和最大回撤序列
+    draw_down_list = pd.Series(draw_down_list,index=net_rtn.index[:-1])
+    #分月度最大回撤
+    draw_down_month = []
+    for i in np.arange(1,len(month_bp)):
+        s = net_value.truncate(before=month_bp[i-1],after=month_bp[i])
+        draw_month,_ = draw_down_cal(s)
+        draw_down_month.append(draw_month)
+    draw_down_month = pd.Series(draw_down_month,index=month_bp[1:])
+    
+    perform = {'sharpe':sharpe,               
+               'stock_rtn':stock_rtn,
+               'index_rtn':index_rtn,
+               'net_rtn':net_rtn,
+               'net_rtn_month':net_rtn_month,
+               'net_rtn_year':net_rtn_year,
+               'max_draw_down':max_draw_down,
+               'draw_down_list':draw_down_list,
+               'draw_down_month':draw_down_month}
+    
+    return stock_pos,index_pos,perform
+
+
+def pos_cal(factor,stock_data,index_data,num_stock,period,time_interval,cost):
+    """
+    输入数据格式同performance_cal()输入格式
+    开盘买入，收盘前卖出，一只股票至少持有两天
+    除第0天外，其余均代表股票/指数在当天收盘后的仓位
+    应该先对factor归一化处理，注意factor为dataframe类型，且有大量nan值
+    
+    指数做空处理
+    整体逻辑为先计算出股票和指数的pos变化
+    position指的是每只股票占所有仓位的比例（会变化是因为有时候需要买的时候卖不出去）
+    整体净值变动为股票和指数净值的均值
+    """
+    date_series = index_data['price_close'].index
+    stock_code = stock_data['price_close'].columns
+    
+    start_time = find_time_index(time_interval[0],date_series)
+    stop_time = find_time_index(time_interval[1],date_series)
+    #切割出所需要回测的日期
+    stock_clz = stock_data['price_close'].iloc[start_time:stop_time,:].values
+    stock_opn = stock_data['price_open'].iloc[start_time:stop_time,:].values
+    index_clz = index_data['price_close'].iloc[start_time:stop_time].values
+    
+    """先計算股票"""
+    #切割出factor需要的日期
+    factor_start_time = find_time_index(time_interval[0],factor.index)
+    factor_stop_time = find_time_index(time_interval[1],factor.index)
+    factor = factor.iloc[factor_start_time:factor_stop_time,:].values#factor为DataFrame格式
+    
+    try:#如果股票停牌数据存在的话
+        is_trade = stock_data['is_trade'].iloc[start_time:stop_time,:].values#为np.array
+    except:#如果股票停牌数据不存在的话则认为全都可以买卖
+        is_trade = np.ones(stock_clz.shape)
+    
+    #根据因子值计算每天应该买的股票序列
+    stock_indice = stock_buy_indice(factor,num_stock,is_trade,stock_clz)
+    stock_pct = np.zeros([1,len(stock_code)])
+    
+    #股票的初始净值和为0.5
+    for i in np.arange(num_stock):
+        stock_pct[0,stock_indice[0,i]] = 0.5/num_stock#第一天开盘之前所有股票的持仓占比相同
+    stock_pct = pd.DataFrame(stock_pct,columns=stock_code)
+    
+    
+    total_day = factor.shape[0]
+    for day in np.arange(0,total_day,period):
+        stock_pct = period_extend(stock_pct,stock_opn,stock_clz,stock_indice,
+                                    day,period,cost,mode='open_buy')
+    #stock_pct = stock_pct.iloc[1:,:]#第一行全为0因此要将其去除，现在没有了
+    stock_pct.index = date_series[start_time:stop_time]
+    
+    """再計算指數"""
+    #初始化指数的每日仓位
+    index_init = 0.5
+    index_rtn_arith = index_clz[1:]/index_clz[:-1]
+    index_net_v = index_init*index_rtn_arith
+    index_net_v = np.insert(index_net_v,0,index_init)
+    index_net_v = pd.DataFrame(index_net_v,index=stock_net_v.index)
+    return stock_pct,index_net_v,factor,stock_indice
+
+def stock_buy_indice(factor,num_stock,is_trade,stock_clz):
+    """
+    用于根据因子值计算每日应该买的股票序列
+    只能选因子值最小的股票
+    factor为DataFrame
+    is_trade,stock_clz为np.array()
+    每一行代表日期
+    每一列代表一支股票
+    """	
+    factor = scistat.zscore(factor,axis=1)#减去均值除以标准差，用于将因子值归一化
+    rtn = np.diff(stock_clz.T,axis=1)/stock_clz.T[:,:-1]
+    #将rtn每一行调整为日期
+    rtn = rtn.T
+    rtn = np.concatenate((np.zeros([1,rtn.shape[1]]),rtn))
+
+    is_limit = np.zeros_like(factor)#factor和rtn的shape应相同
+    is_limit[abs(rtn)>0.1] = 1
+    factor[is_trade==0]=np.nan#将不能停牌的股票因子值替换为nan
+    factor[is_limit==1]=np.nan#将涨停或者跌停的股票的因子值设置为nan
+    #排序选出前num_stock数据
+    stock_indice = np.argsort(factor,axis=1)
+    stock_indice = stock_indice[:,:num_stock]
+    return stock_indice
+
+
+def find_time_index(time_point,time_series):
+    """
+    time_point为时间string,time_series为时间序列string
+    此函数用于寻找time_point在time_series中的位置
+    """
+    time_point = pd.to_datetime(time_point)
+    time_series = pd.to_datetime(time_series)
+    time_diff = list(abs(time_series - time_point))
+    time_index = time_diff.index(min(time_diff))
+    return time_index
+
+
+def period_extend(stock_net_v,stock_opn,stock_clz,stock_indice,
+                  day,period,cost,mode='open_buy'):
+    """
+    此函数用于计算在每个换仓周期内的股票仓位变化情况，并将其与之前的仓位变化合并
+    输入：
+        stock_net_v为DataFrame
+        stock_clz,stock_opn,stock_indice为二维ndarray
+        cost,day,period为标量
+    输出：
+        stock_pos--DataFrame格式
+    换仓时成本计算按照全部卖出再买入计算
+    """  
+    stock_to_hold = stock_indice[day,:]#得到这一周期应该持有的股票
+    init_value = stock_net_v.iloc[-1,:].sum()*(1-cost)#全部賣出
+    num_stock_trade = stock_indice.shape[1]
+    pos_init = init_value/num_stock_trade#全部卖出
+    #计算该时间段内每日淨值
+    opn_data = stock_opn[day,:]
+    clz_data = stock_clz[day:day+period,:]
+    period_rtn = clz_data/opn_data*pos_init#先计算出所有股票在这段时间内的仓位变化
+    period_pos = np.zeros_like(period_rtn)
+    #将结果整理为DataFrame格式
+    for stock in np.arange(period_pos.shape[1]):#stock为整数
+        if stock in stock_to_hold:#说明该时期内需要持仓该股票
+            period_pos[:,stock] = period_rtn[:,stock]
+    period_pos = pd.DataFrame(period_pos,columns=stock_net_v.columns)       
+    stock_net_v = pd.concat([stock_net_v,period_pos])
+    return stock_net_v
+    
+def rtn_cal(stock_rtn,index_rtn):
+    net_rtn = (stock_rtn - index_rtn)/2
+    net_rtn[0] = 0
+    net_rtn = net_rtn.cumsum()
+    return net_rtn
+
+
+def draw_down_cal(net_value):
+    """
+    用于计算最大回撤和最大回撤序列
+    net_value为series格式
+    """
+    max_draw_down = 0
+    draw_down_list = []
+    temp_max_value = 0
+    for i in range(1, len(net_value)):
+        temp_max_value = max(temp_max_value, net_value[i-1])
+        max_draw_down = min(max_draw_down, net_value[i]/temp_max_value-1)
+        draw_down_list.append(max_draw_down)
+    return max_draw_down,draw_down_list
+
+def visual(perform,name=None):
+    """
+    用于将策略表现可视化
+    """
+    stock_rtn = perform['stock_rtn']
+    index_rtn = perform['index_rtn']
+    net_rtn = perform['net_rtn']
+    sharpe = perform['sharpe']
+    net_rtn_year = perform['net_rtn_year']
+    max_draw_down = perform['max_draw_down']
+    draw_down_list = perform['draw_down_list']
+    draw_down_month = perform['draw_down_month']
+    
+    title1 = \
+    """收益率曲线\n 夏普率=%.2f  年化收益率=%.2f""" % (sharpe,net_rtn_year)
+    title2 = '每日回撤  最大回撤=%.2f' % (max_draw_down)
+    title3 = '分月度收益率'
+    title4 = '月度回撤'
+    fig = tools.make_subplots(rows=2,cols=2,
+                              subplot_titles=(title1,title2,title3,title4))
+    #收益率变动序列，左上角
+    
+    trace1 = go.Scatter(x=stock_rtn.index,y=stock_rtn.values,\
+                        name='stock')
+    trace2 = go.Scatter(x=index_rtn.index,y=index_rtn.values,name='index')
+    trace3 = go.Scatter(x=net_rtn.index,y=net_rtn.values,name='net')
+#    data1 = [trace1,trace2,trace3]
+    fig.append_trace(trace1,1,1)
+    fig.append_trace(trace2,1,1)
+    fig.append_trace(trace3,1,1)
+    
+    #分月度收益率
+    net_rtn_month = perform['net_rtn_month'].sum(axis=1)
+    trace4 = go.Bar(x=net_rtn_month.index,y=net_rtn_month.values,
+                    name='monthly net rtn')
+    fig.append_trace(trace4,2,1)
+    
+    #每日最大回撤
+    trace5 = go.Scatter(x=draw_down_list.index,y=draw_down_list.values,
+                        name='daily draw down')
+    fig.append_trace(trace5,1,2)
+    
+    #月度最大回撤
+    trace6 = go.Bar(x=draw_down_month.index,y=draw_down_month.values,
+                    name='monthly draw down')
+    fig.append_trace(trace6,2,2)
+    
+    file_name = name+'_perform.html'
+    py.plot(fig,filename=file_name)
+#=====================脚本测试区=========================================
+if __name__=='__main__':
+    start = time.clock()
+    print("这个不是主文件不要运行")
+    stop = time.clock()
+    print('程序运行时间为：'+str(stop-start))
